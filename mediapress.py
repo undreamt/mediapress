@@ -54,7 +54,8 @@ def check_dependencies():
 
     # FFmpeg
     try:
-        proc = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=10)
+        proc = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=10,
+                              creationflags=subprocess.CREATE_NO_WINDOW)
         if proc.returncode == 0:
             line = proc.stdout.splitlines()[0] if proc.stdout else ""
             ver = line.split("version")[1].strip().split()[0] if "version" in line else "unknown"
@@ -66,7 +67,8 @@ def check_dependencies():
 
     # FFprobe
     try:
-        proc = subprocess.run(["ffprobe", "-version"], capture_output=True, text=True, timeout=10)
+        proc = subprocess.run(["ffprobe", "-version"], capture_output=True, text=True, timeout=10,
+                              creationflags=subprocess.CREATE_NO_WINDOW)
         if proc.returncode == 0:
             line = proc.stdout.splitlines()[0] if proc.stdout else ""
             ver = line.split("version")[1].strip().split()[0] if "version" in line else "unknown"
@@ -194,7 +196,8 @@ def probe_file(filepath: str):
             "-show_streams", "-show_format",
             filepath
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60,
+                              creationflags=subprocess.CREATE_NO_WINDOW)
         if proc.returncode != 0:
             return None, proc.stderr
         return json.loads(proc.stdout), None
@@ -735,7 +738,8 @@ def build_ffmpeg_audio_cmd(input_path, output_path):
 def run_ffmpeg(cmd):
     """Run ffmpeg, return (success, stderr)."""
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               creationflags=subprocess.CREATE_NO_WINDOW)
         _, stderr = proc.communicate()
         return proc.returncode == 0, stderr.decode("utf-8", errors="replace")
     except Exception as e:
