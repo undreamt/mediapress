@@ -353,6 +353,28 @@ class FileRecord:
 # File Scanning
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _align_to_ftyp(raw: bytes) -> bytes:
+    """
+    Given raw bytes that should be an MP4, find the first valid ftyp box
+    and return bytes starting at its box-size field (4 bytes before 'ftyp').
+    Searches up to 65536 bytes. Returns raw unchanged if not found.
+    """
+    search = raw[:65536]
+    pos = 0
+    while True:
+        idx = search.find(b'ftyp', pos)
+        if idx < 4:
+            if idx == -1:
+                break
+            pos = idx + 1
+            continue
+        # Validate: 4 bytes before 'ftyp' is the box size (big-endian uint32 > 0)
+        box_size = struct.unpack(">I", search[idx - 4:idx])[0]
+        if box_size >= 8:  # minimum valid box: 4 (size) + 4 (type) = 8
+            return raw[idx - 4:]
+        pos = idx + 1
+    return raw
+
 def determine_status(record: FileRecord, output_folder: Path, skip_existing: bool, crf: int):
     """Determine what action will be taken for this file."""
     ext = record.ext.lower()
@@ -485,11 +507,7 @@ def scan_folder(input_folder: Path, output_folder: Path, skip_existing: bool, cr
                 # For scan, do a quick probe by extracting first
                 try:
                     file_data = filepath.read_bytes()
-                    video_bytes = file_data[video_offset:]
-                    # Align to ftyp box start — skip any padding bytes before the MP4 container
-                    ftyp_rel = video_bytes[:516].find(b'ftyp')
-                    if ftyp_rel >= 4:
-                        video_bytes = video_bytes[ftyp_rel - 4:]
+                    video_bytes = _align_to_ftyp(file_data[video_offset:])
                     if len(video_bytes) >= 10240:
                         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
                             tmp.write(video_bytes)
@@ -584,6 +602,36 @@ def scan_folder(input_folder: Path, output_folder: Path, skip_existing: bool, cr
                 rec.current_format = "Unknown"
 
             determine_status(rec, output_folder, skip_existing, crf)
+            records.append(rec)
+
+        elif ext in GIF_EXTENSIONS:
+            rec = FileRecord()
+            rec.filepath = filepath
+            rec.rel_path = str(rel)
+            rec.filename = filepath.name
+            rec.ext = ext
+            rec.file_type = "GIF"
+            rec.show_rotate = False
+            rec.current_format = "GIF"
+            rec.bitrate_display = "—"
+
+            probe_data, _ = probe_file(str(filepath))
+            if probe_data:
+                info = parse_probe(probe_data)
+                rec.probe_info = info
+                rec.resolution = format_resolution(info)
+            else:
+                rec.resolution = "—"
+
+            # Output stays .gif — same relative path, same extension
+            rec.output_path = output_folder / rel
+            if skip_existing and rec.output_path.exists():
+                rec.status = "Will skip (output exists)"
+                rec.action_taken = "Skipped (output exists)"
+            else:
+                rec.status = "Will compress"
+                rec.action_taken = "Compressed"
+
             records.append(rec)
 
         else:
@@ -726,11 +774,7 @@ def process_record(record: FileRecord, crf: int, tmp_dir: Path):
         try:
             with open(record.filepath, "rb") as f:
                 data = f.read()
-            video_bytes = data[record.motion_video_offset:]
-            # Align to ftyp box start — skip any padding bytes before the MP4 container
-            ftyp_rel = video_bytes[:516].find(b'ftyp')
-            if ftyp_rel >= 4:
-                video_bytes = video_bytes[ftyp_rel - 4:]
+            video_bytes = _align_to_ftyp(data[record.motion_video_offset:])
             if len(video_bytes) < 10240:
                 record.result = "Failed"
                 record.error_message = "Embedded video too small or corrupt"
@@ -756,13 +800,37 @@ def process_record(record: FileRecord, crf: int, tmp_dir: Path):
             cmd = build_ffmpeg_remux_cmd(input_for_ffmpeg, record.output_path)
             success, stderr = run_ffmpeg(cmd)
         elif action == "Compressed":
-            if record.file_type in ("Video", "Motion Photo (video)"):
+            if record.file_type == "Motion Photo (video)":
+                # Simpler command for extracted motion photo videos — no metadata
+                # mapping or scale filter which can fail on bare extracted MP4s
+                has_audio = info.get("has_audio") if info else False
+                cmd = [
+                    "ffmpeg", "-loglevel", "error",
+                    "-i", str(input_for_ffmpeg),
+                    "-c:v", "libx264", "-crf", str(crf), "-preset", "medium",
+                ]
+                if has_audio:
+                    cmd += ["-c:a", "aac", "-b:a", "128k"]
+                else:
+                    cmd += ["-an"]
+                if record.rotation != "None":
+                    rotate_map = {
+                        "90° Clockwise": "transpose=1",
+                        "90° Counter-clockwise": "transpose=2",
+                        "180°": "transpose=1,transpose=1",
+                    }
+                    vf = rotate_map.get(record.rotation)
+                    if vf:
+                        cmd += ["-vf", vf]
+                cmd += ["-movflags", "+faststart", "-y", str(record.output_path)]
+                success, stderr = run_ffmpeg(cmd)
+                record.crf_used = str(crf)
+            elif record.file_type == "Video":
                 if info:
                     cmd = build_ffmpeg_video_cmd(
                         input_for_ffmpeg, record.output_path, info, crf, record.rotation
                     )
                 else:
-                    # Fallback basic compress
                     cmd = [
                         "ffmpeg", "-loglevel", "error", "-i", str(input_for_ffmpeg),
                         "-c:v", "libx264", "-crf", str(crf),
@@ -809,14 +877,6 @@ def process_record(record: FileRecord, crf: int, tmp_dir: Path):
                     record.output_resolution = format_resolution(info)
                     record.output_bitrate = "128 kbps (audio)"
 
-                # Also copy the linked still JPEG (motion photo)
-                if record.is_motion_video_row and record.linked_still is not None:
-                    still = record.linked_still
-                    try:
-                        still.output_path.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(str(still.filepath), str(still.output_path))
-                    except Exception as still_err:
-                        record.error_message += f" | Still copy failed: {still_err}"
         else:
             record.result = "Failed"
             record.error_message = stderr[-500:] if len(stderr) > 500 else stderr
