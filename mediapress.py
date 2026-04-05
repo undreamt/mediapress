@@ -1217,7 +1217,6 @@ class FileTableWidget(tk.Frame):
         _apply_treeview_theme(self.tree)
 
         self.tree.bind("<ButtonPress-1>", self._on_click)
-        self.tree.bind("<MouseWheel>", self._dismiss_overlay)
 
     def _status_tag(self, status):
         s = status.lower()
@@ -1297,29 +1296,19 @@ class FileTableWidget(tk.Frame):
 
         elif col == "#10":   # Rotate column
             if rec.show_rotate:
-                self._show_rotate_overlay(row, rec, idx)
+                self._show_rotate_menu(event, row, rec, idx)
             else:
                 self._dismiss_overlay()
         else:
             self._dismiss_overlay()
 
-    def _show_rotate_overlay(self, iid, rec, idx):
-        """Float a CTkOptionMenu over the rotate cell."""
+    def _show_rotate_menu(self, event, iid, rec, idx):
+        """Pop up a native menu to choose rotation for this row."""
         self._dismiss_overlay()
-        bbox = self.tree.bbox(iid, column="rotate")
-        if not bbox:
-            return
-        x, y, w, h = bbox
-        # Offset by the tree widget's position within this CTkFrame
-        tx = self.tree.winfo_x()
-        ty = self.tree.winfo_y()
 
-        var = tk.StringVar(value=rec.rotation)
-
-        def on_select(val):
+        def apply_rotation(val):
             rec.rotation = val
             self.tree.set(iid, "rotate", val)
-            self._dismiss_overlay()
             if rec.file_type in ("Video", "Motion Photo (video)") and rec.probe_info:
                 _determine_video_status(rec, rec.probe_info)
                 self.tree.set(iid, "status", rec.status)
@@ -1329,16 +1318,16 @@ class FileTableWidget(tk.Frame):
             if self._on_rotate_change:
                 self._on_rotate_change()
 
-        overlay = ctk.CTkOptionMenu(
-            self,
-            values=ROTATE_OPTIONS,
-            variable=var,
-            command=on_select,
-            font=ctk.CTkFont(size=11),
-            dynamic_resizing=False,
-        )
-        overlay.place(x=tx + x, y=ty + y, width=max(w, 160), height=max(h, 28))
-        self._overlay = overlay
+        menu = tk.Menu(self, tearoff=0)
+        for option in ROTATE_OPTIONS:
+            menu.add_command(label=option, command=lambda v=option: apply_rotation(v))
+
+        rx = self.tree.winfo_rootx() + event.x
+        ry = self.tree.winfo_rooty() + event.y
+        try:
+            menu.tk_popup(rx, ry)
+        finally:
+            menu.grab_release()
 
     def _dismiss_overlay(self, event=None):
         if self._overlay:
