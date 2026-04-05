@@ -19,6 +19,7 @@ from datetime import datetime
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 import tkinter as tk
+import tkinter.ttk as ttk
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -328,6 +329,10 @@ class FileRecord:
         self.is_motion_still_row = False
         self.is_motion_video_row = False
         self.linked_record = None     # other half of motion photo pair
+        self.linked_still = None      # still record stored off-list (video row only)
+
+        # Per-row include/exclude
+        self.enabled = True
 
         # Processing results
         self.action_taken = ""
@@ -480,6 +485,10 @@ def scan_folder(input_folder: Path, output_folder: Path, skip_existing: bool, cr
                 try:
                     file_data = filepath.read_bytes()
                     video_bytes = file_data[video_offset:]
+                    # Align to ftyp box start — skip any padding bytes before the MP4 container
+                    ftyp_rel = video_bytes[:516].find(b'ftyp')
+                    if ftyp_rel >= 4:
+                        video_bytes = video_bytes[ftyp_rel - 4:]
                     if len(video_bytes) >= 10240:
                         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
                             tmp.write(video_bytes)
@@ -505,10 +514,12 @@ def scan_folder(input_folder: Path, output_folder: Path, skip_existing: bool, cr
                     video_rec.probe_error = str(e)
                     video_rec.current_format = "Unknown"
 
-                determine_status(still_rec, output_folder, skip_existing, crf)
+                # Set up the still output path for later processing
+                still_rec.output_path = output_folder / rel
                 determine_status(video_rec, output_folder, skip_existing, crf)
 
-                records.append(still_rec)
+                # Only the video row appears in the table; still is stored off-list
+                video_rec.linked_still = still_rec
                 records.append(video_rec)
             else:
                 # Regular JPEG — unsupported
@@ -619,7 +630,7 @@ def build_ffmpeg_video_cmd(input_path, output_path, info, crf, rotation):
     vf = scale + rotate_filter
 
     cmd = [
-        "ffmpeg", "-i", str(input_path),
+        "ffmpeg", "-loglevel", "error", "-i", str(input_path),
         "-c:v", "libx264",
         "-crf", str(crf),
         "-preset", "medium",
@@ -641,7 +652,7 @@ def build_ffmpeg_video_cmd(input_path, output_path, info, crf, rotation):
 
 def build_ffmpeg_remux_cmd(input_path, output_path):
     return [
-        "ffmpeg", "-i", str(input_path),
+        "ffmpeg", "-loglevel", "error", "-i", str(input_path),
         "-c", "copy",
         "-map_metadata", "0",
         "-y", str(output_path)
@@ -650,7 +661,7 @@ def build_ffmpeg_remux_cmd(input_path, output_path):
 
 def build_ffmpeg_audio_cmd(input_path, output_path):
     return [
-        "ffmpeg", "-i", str(input_path),
+        "ffmpeg", "-loglevel", "error", "-i", str(input_path),
         "-c:a", "libmp3lame",
         "-b:a", "128k",
         "-map_metadata", "0",
@@ -715,6 +726,10 @@ def process_record(record: FileRecord, crf: int, tmp_dir: Path):
             with open(record.filepath, "rb") as f:
                 data = f.read()
             video_bytes = data[record.motion_video_offset:]
+            # Align to ftyp box start — skip any padding bytes before the MP4 container
+            ftyp_rel = video_bytes[:516].find(b'ftyp')
+            if ftyp_rel >= 4:
+                video_bytes = video_bytes[ftyp_rel - 4:]
             if len(video_bytes) < 10240:
                 record.result = "Failed"
                 record.error_message = "Embedded video too small or corrupt"
@@ -762,18 +777,36 @@ def process_record(record: FileRecord, crf: int, tmp_dir: Path):
             return record
 
         if success:
-            record.result = "Success"
-            if record.output_path.exists():
-                out_size = record.output_path.stat().st_size
-                record.output_size_mb = out_size / (1024 * 1024)
-                if record.original_size_mb > 0:
-                    record.size_reduction_pct = (
-                        1 - record.output_size_mb / record.original_size_mb
-                    ) * 100
-            record.output_format = "H.264 / MP4" if record.file_type in ("Video", "Motion Photo (video)") else "MP3"
-            if info:
-                record.output_resolution = format_resolution(info)
-                record.output_bitrate = "128 kbps (audio)"
+            # Validate output is non-trivial
+            if record.output_path.exists() and record.output_path.stat().st_size < 1024:
+                record.result = "Failed"
+                record.error_message = "Output file is suspiciously small (<1 KB) — likely corrupt input"
+                try:
+                    record.output_path.unlink()
+                except Exception:
+                    pass
+            else:
+                record.result = "Success"
+                if record.output_path.exists():
+                    out_size = record.output_path.stat().st_size
+                    record.output_size_mb = out_size / (1024 * 1024)
+                    if record.original_size_mb > 0:
+                        record.size_reduction_pct = (
+                            1 - record.output_size_mb / record.original_size_mb
+                        ) * 100
+                record.output_format = "H.264 / MP4" if record.file_type in ("Video", "Motion Photo (video)") else "MP3"
+                if info:
+                    record.output_resolution = format_resolution(info)
+                    record.output_bitrate = "128 kbps (audio)"
+
+                # Also copy the linked still JPEG (motion photo)
+                if record.is_motion_video_row and record.linked_still is not None:
+                    still = record.linked_still
+                    try:
+                        still.output_path.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(str(still.filepath), str(still.output_path))
+                    except Exception as still_err:
+                        record.error_message += f" | Still copy failed: {still_err}"
         else:
             record.result = "Failed"
             record.error_message = stderr[-500:] if len(stderr) > 500 else stderr
@@ -992,141 +1025,252 @@ class AboutWindow(ctk.CTkToplevel):
 # File Table Widget
 # ─────────────────────────────────────────────────────────────────────────────
 
-COLUMNS = ["#", "Filename", "Relative Path", "Type", "Current Format",
-           "Resolution", "Bitrate", "Status", "Rotate"]
-COL_WIDTHS = [40, 180, 160, 140, 160, 100, 100, 200, 160]
+COL_IDS    = ["include", "num", "filename", "relpath", "filetype",
+               "format", "resolution", "bitrate", "status", "rotate"]
+COLUMNS    = ["Include", "#", "Filename", "Relative Path", "Type",
+               "Current Format", "Resolution", "Bitrate", "Status", "Rotate"]
+COL_WIDTHS = [52, 40, 180, 160, 140, 160, 100, 100, 200, 160]
+
+
+def _apply_treeview_theme(tree_widget):
+    """Style the Treeview to match the current CTk appearance mode."""
+    try:
+        mode = ctk.get_appearance_mode()
+    except Exception:
+        mode = "Dark"
+    is_dark = mode in ("Dark",) or (mode == "System")
+
+    bg      = "#1e1e1e" if is_dark else "#f0f0f0"
+    fg      = "#e0e0e0" if is_dark else "#1a1a1a"
+    sel_bg  = "#2d5a8e" if is_dark else "#4a90d9"
+    hdr_bg  = "#2b2b2b" if is_dark else "#d0d0d0"
+    odd_bg  = "#252525" if is_dark else "#f5f5f5"
+    even_bg = "#1e1e1e" if is_dark else "#ebebeb"
+
+    style = ttk.Style()
+    style.theme_use("clam")
+    style.configure("MediaPress.Treeview",
+                    background=bg,
+                    foreground=fg,
+                    fieldbackground=bg,
+                    rowheight=26,
+                    borderwidth=0,
+                    font=("Segoe UI", 10))
+    style.configure("MediaPress.Treeview.Heading",
+                    background=hdr_bg,
+                    foreground=fg,
+                    relief="flat",
+                    font=("Segoe UI", 10, "bold"))
+    style.map("MediaPress.Treeview",
+              background=[("selected", sel_bg)],
+              foreground=[("selected", "white")])
+
+    try:
+        tree_widget.tag_configure("odd",       background=odd_bg,  foreground=fg)
+        tree_widget.tag_configure("even",      background=even_bg, foreground=fg)
+        tree_widget.tag_configure("compress",  foreground="#e07840")
+        tree_widget.tag_configure("copy",      foreground="#40c070")
+        tree_widget.tag_configure("remux",     foreground="#4090d0")
+        tree_widget.tag_configure("skip",      foreground="#aaaaaa")
+        tree_widget.tag_configure("unsupport", foreground="#666666")
+    except Exception:
+        pass
 
 
 class FileTableWidget(ctk.CTkFrame):
-    """Scrollable table for file records."""
+    """Treeview-based file table — fast, properly aligned, resizable columns."""
 
     def __init__(self, parent, **kwargs):
         super().__init__(parent, **kwargs)
         self.records = []
-        self.rotate_vars = {}   # row_index -> StringVar
+        self._on_rotate_change = None   # callback set by MediaPressApp
+        self._overlay = None            # floating CTkOptionMenu for rotate
         self._build_ui()
 
     def _build_ui(self):
-        # Header
-        self.header_frame = ctk.CTkFrame(self, fg_color=("gray80", "gray20"))
-        self.header_frame.pack(fill="x", side="top")
+        # Plain tk.Frame so scrollbar docks flush with no CTk padding
+        container = tk.Frame(self, bg="#1e1e1e")
+        container.pack(fill="both", expand=True)
+        container.grid_rowconfigure(0, weight=1)
+        container.grid_columnconfigure(0, weight=1)
 
-        for i, (col, w) in enumerate(zip(COLUMNS, COL_WIDTHS)):
-            lbl = ctk.CTkLabel(self.header_frame, text=col, width=w,
-                               font=ctk.CTkFont(size=11, weight="bold"),
-                               anchor="w")
-            lbl.grid(row=0, column=i, padx=2, pady=4, sticky="w")
+        self.tree = ttk.Treeview(
+            container,
+            columns=COL_IDS,
+            show="headings",
+            selectmode="extended",
+            style="MediaPress.Treeview",
+        )
 
-        # Scrollable body
-        self.scroll_frame = ctk.CTkScrollableFrame(self, corner_radius=0)
-        self.scroll_frame.pack(fill="both", expand=True)
+        vsb = ttk.Scrollbar(container, orient="vertical", command=self.tree.yview)
+        hsb = ttk.Scrollbar(container, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+
+        for col_id, col_name, width in zip(COL_IDS, COLUMNS, COL_WIDTHS):
+            self.tree.heading(col_id, text=col_name, anchor="w")
+            stretch = col_id not in ("include", "num")
+            self.tree.column(col_id, width=width, minwidth=36, stretch=stretch, anchor="w")
+
+        _apply_treeview_theme(self.tree)
+
+        self.tree.bind("<ButtonPress-1>", self._on_click)
+        self.tree.bind("<MouseWheel>", self._dismiss_overlay)
+        self.tree.bind("<Configure>", self._dismiss_overlay)
+
+    def _status_tag(self, status):
+        s = status.lower()
+        if "compress" in s:
+            return "compress"
+        if "remux" in s:
+            return "remux"
+        if "copy" in s:
+            return "copy"
+        if "unsupported" in s:
+            return "unsupport"
+        if "skip" in s:
+            return "skip"
+        return ""
 
     def clear(self):
-        for widget in self.scroll_frame.winfo_children():
-            widget.destroy()
-        self.rotate_vars.clear()
+        self._dismiss_overlay()
+        for iid in self.tree.get_children():
+            self.tree.delete(iid)
         self.records = []
 
     def load_records(self, records):
         self.clear()
-        self.records = records
-        for i, rec in enumerate(records):
-            self._add_row(i, rec)
+        self.records = list(records)
+        for idx, rec in enumerate(self.records):
+            self._insert_row(idx, rec)
 
-    def _add_row(self, idx, rec: FileRecord):
-        bg = ("gray90", "gray17") if idx % 2 == 0 else ("gray85", "gray15")
-        row_frame = ctk.CTkFrame(self.scroll_frame, fg_color=bg, corner_radius=0)
-        row_frame.pack(fill="x", pady=0)
+    def _insert_row(self, idx, rec: FileRecord):
+        include_glyph = "☑" if rec.enabled else "☐"
+        rotate_text   = rec.rotation if rec.show_rotate else "—"
+        base_tag = "even" if idx % 2 == 0 else "odd"
+        status_tag = self._status_tag(rec.status)
+        tags = (base_tag, status_tag) if status_tag else (base_tag,)
 
-        status_color = self._status_color(rec.status)
+        self.tree.insert(
+            "", "end",
+            iid=str(idx),
+            values=(
+                include_glyph,
+                str(idx + 1),
+                rec.filename,
+                rec.rel_path,
+                rec.file_type,
+                rec.current_format,
+                rec.resolution,
+                rec.bitrate_display,
+                rec.status,
+                rotate_text,
+            ),
+            tags=tags,
+        )
 
-        values = [
-            str(idx + 1),
-            rec.filename,
-            rec.rel_path,
-            rec.file_type,
-            rec.current_format,
-            rec.resolution,
-            rec.bitrate_display,
-            rec.status,
-        ]
-        widths = COL_WIDTHS[:-1]
+    def _on_click(self, event):
+        col = self.tree.identify_column(event.x)
+        row = self.tree.identify_row(event.y)
+        if not row:
+            self._dismiss_overlay()
+            return
 
-        for col_i, (val, w) in enumerate(zip(values, widths)):
-            color = None
-            if col_i == 7:  # Status column
-                color = status_color
-            lbl = ctk.CTkLabel(row_frame, text=val, width=w, anchor="w",
-                               font=ctk.CTkFont(size=11),
-                               text_color=color if color else ("black", "white"))
-            lbl.grid(row=0, column=col_i, padx=2, pady=2, sticky="w")
+        idx = int(row)
+        if idx >= len(self.records):
+            return
+        rec = self.records[idx]
 
-        # Rotate column
-        if rec.show_rotate:
-            var = tk.StringVar(value=rec.rotation)
-            self.rotate_vars[idx] = var
+        if col == "#1":      # Include column
+            rec.enabled = not rec.enabled
+            self.tree.set(row, "include", "☑" if rec.enabled else "☐")
+            if self._on_rotate_change:
+                self._on_rotate_change()
 
-            def on_rotate_change(v, r=rec, i=idx):
-                r.rotation = v
-                self._refresh_status(i, r)
-
-            var.trace_add("write", lambda *a, v=var, r=rec, i=idx:
-                          on_rotate_change(v.get(), r, i))
-
-            opt = ctk.CTkOptionMenu(row_frame, values=ROTATE_OPTIONS,
-                                    variable=var, width=COL_WIDTHS[-1] - 8,
-                                    font=ctk.CTkFont(size=11),
-                                    dynamic_resizing=False)
-            opt.grid(row=0, column=len(COLUMNS) - 1, padx=2, pady=2, sticky="w")
+        elif col == "#10":   # Rotate column
+            if rec.show_rotate:
+                self._show_rotate_overlay(row, rec, idx)
+            else:
+                self._dismiss_overlay()
         else:
-            ctk.CTkLabel(row_frame, text="—", width=COL_WIDTHS[-1],
-                         anchor="w", font=ctk.CTkFont(size=11)).grid(
-                row=0, column=len(COLUMNS) - 1, padx=2, pady=2, sticky="w")
+            self._dismiss_overlay()
 
-        row_frame._status_label = None
-        # Keep reference for status refresh
-        status_lbl = row_frame.grid_slaves(row=0, column=7)
-        if status_lbl:
-            row_frame._status_label = status_lbl[0]
+    def _show_rotate_overlay(self, iid, rec, idx):
+        """Float a CTkOptionMenu over the rotate cell."""
+        self._dismiss_overlay()
+        bbox = self.tree.bbox(iid, column="rotate")
+        if not bbox:
+            return
+        x, y, w, h = bbox
+        # Offset by the tree widget's position within this CTkFrame
+        tx = self.tree.winfo_x()
+        ty = self.tree.winfo_y()
 
-    def _refresh_status(self, idx, rec: FileRecord):
-        """Called when rotation changes — re-evaluate status."""
-        # The output_folder and skip_existing are not stored here, so we just
-        # update the action_taken based on current rotation.
-        if rec.file_type in ("Video", "Motion Photo (video)") and rec.probe_info:
-            _determine_video_status(rec, rec.probe_info)
-        # Re-render would require full reload — for simplicity trigger summary update
-        if hasattr(self, "_on_rotate_change"):
-            self._on_rotate_change()
+        var = tk.StringVar(value=rec.rotation)
 
-    def _status_color(self, status):
-        color_map = {
-            "Will compress": ("#c0621a", "#e07840"),
-            "Will copy (within spec)": ("#1a7a3a", "#40c070"),
-            "Will remux (right codec, wrong container)": ("#1a5a9a", "#4090d0"),
-            "Will skip (output exists)": ("#888888", "#aaaaaa"),
-            "Unsupported — skip": ("#888888", "#666666"),
-            "Will copy (still image)": ("#1a7a3a", "#40c070"),
-        }
-        return color_map.get(status, None)
+        def on_select(val):
+            rec.rotation = val
+            self.tree.set(iid, "rotate", val)
+            self._dismiss_overlay()
+            if rec.file_type in ("Video", "Motion Photo (video)") and rec.probe_info:
+                _determine_video_status(rec, rec.probe_info)
+                self.tree.set(iid, "status", rec.status)
+                base_tag = "even" if idx % 2 == 0 else "odd"
+                st = self._status_tag(rec.status)
+                self.tree.item(iid, tags=(base_tag, st) if st else (base_tag,))
+            if self._on_rotate_change:
+                self._on_rotate_change()
+
+        overlay = ctk.CTkOptionMenu(
+            self,
+            values=ROTATE_OPTIONS,
+            variable=var,
+            command=on_select,
+            font=ctk.CTkFont(size=11),
+            dynamic_resizing=False,
+        )
+        overlay.place(x=tx + x, y=ty + y, width=max(w, 160), height=max(h, 28))
+        self._overlay = overlay
+
+    def _dismiss_overlay(self, event=None):
+        if self._overlay:
+            try:
+                self._overlay.place_forget()
+                self._overlay.destroy()
+            except Exception:
+                pass
+            self._overlay = None
 
     def update_row_status(self, idx, status, result=""):
-        """Update the status column text for a given row during processing."""
+        """Update status cell during a processing run (called via self.after)."""
         try:
-            frames = self.scroll_frame.winfo_children()
-            if idx < len(frames):
-                frame = frames[idx]
-                labels = [w for w in frame.winfo_children()
-                          if isinstance(w, ctk.CTkLabel)]
-                # Status is column index 7
-                if len(labels) > 7:
-                    color = self._status_color(status)
-                    text = status
-                    if result:
-                        text = result
-                    labels[7].configure(text=text, text_color=color if color else ("black", "white"))
+            iid = str(idx)
+            text = result if result else status
+            self.tree.set(iid, "status", text)
+            base_tag = "even" if idx % 2 == 0 else "odd"
+            st = self._status_tag(status)
+            self.tree.item(iid, tags=(base_tag, st) if st else (base_tag,))
         except Exception:
             pass
+
+    def select_all(self):
+        for rec in self.records:
+            rec.enabled = True
+        for iid in self.tree.get_children():
+            self.tree.set(iid, "include", "☑")
+        if self._on_rotate_change:
+            self._on_rotate_change()
+
+    def deselect_all(self):
+        for rec in self.records:
+            rec.enabled = False
+        for iid in self.tree.get_children():
+            self.tree.set(iid, "include", "☐")
+        if self._on_rotate_change:
+            self._on_rotate_change()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1242,9 +1386,16 @@ class MediaPressApp(ctk.CTk):
         self.banner_label.pack(padx=10, pady=6)
 
         # ── Section 3: File Table ──
+        sel_row = ctk.CTkFrame(main, fg_color="transparent")
+        sel_row.pack(fill="x", pady=(4, 0))
+        ctk.CTkButton(sel_row, text="Select All", width=100,
+                      command=lambda: self.table.select_all()).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(sel_row, text="Deselect All", width=100,
+                      command=lambda: self.table.deselect_all()).pack(side="left")
+
         self.table = FileTableWidget(main)
         self.table._on_rotate_change = self._update_summary
-        self.table.pack(fill="both", expand=True, pady=(4, 4))
+        self.table.pack(fill="both", expand=True, pady=(2, 4))
 
         # ── Section 4: Summary Bar ──
         self.summary_var = tk.StringVar(value="No files scanned yet.")
@@ -1396,24 +1547,31 @@ class MediaPressApp(ctk.CTk):
         self.scan_btn.configure(state="normal", text="Scan Files")
 
         has_deps = all(v.get("found") for k, v in self.dep_results.items() if k != "python")
-        has_work = any(r.status not in ("Unsupported — skip", "Will skip (output exists)")
+        has_work = any(r.enabled and r.status not in ("Unsupported — skip", "Will skip (output exists)")
                        for r in records)
         if has_deps and self.input_var.get() and self.output_var.get() and has_work:
             self.run_btn.configure(state="normal")
 
     def _update_summary(self):
         total = len(self.records)
-        will_compress = sum(1 for r in self.records
+        enabled = [r for r in self.records if r.enabled]
+        excluded = total - len(enabled)
+        will_compress = sum(1 for r in enabled
                             if r.status in ("Will compress",
                                             "Will remux (right codec, wrong container)"))
-        will_copy = sum(1 for r in self.records
+        will_copy = sum(1 for r in enabled
                         if r.status in ("Will copy (within spec)", "Will copy (still image)"))
-        will_skip = sum(1 for r in self.records
+        will_skip = sum(1 for r in enabled
                         if r.status in ("Will skip (output exists)", "Unsupported — skip"))
-        self.summary_var.set(
-            f"{total} files found — {will_compress} will be compressed, "
-            f"{will_copy} will be copied/remuxed, {will_skip} will be skipped"
-        )
+        parts = [f"{total} files found"]
+        if excluded:
+            parts.append(f"{excluded} excluded")
+        parts += [
+            f"{will_compress} will be compressed",
+            f"{will_copy} will be copied/remuxed",
+            f"{will_skip} will be skipped",
+        ]
+        self.summary_var.set(" — ".join(parts))
 
     # ── Run / Cancel ──────────────────────────────────────────────────────────
 
@@ -1450,8 +1608,11 @@ class MediaPressApp(ctk.CTk):
         self._clear_report()
 
         crf = self.crf_var.get()
-        records_to_process = [r for r in self.records
-                               if r.status not in ("Unsupported — skip",)]
+        records_to_process = [
+            (orig_idx, r)
+            for orig_idx, r in enumerate(self.records)
+            if r.enabled and r.status not in ("Unsupported — skip",)
+        ]
         total = len(records_to_process)
         start_time = time.time()
 
@@ -1460,35 +1621,39 @@ class MediaPressApp(ctk.CTk):
             processed = 0
             results = []
 
-            for i, rec in enumerate(records_to_process):
+            for i, (orig_idx, rec) in enumerate(records_to_process):
                 if self.cancel_event.is_set():
                     rec.result = "Cancelled"
                     rec.action_taken = "Cancelled"
                     results.append(rec)
-                    for remaining in records_to_process[i:]:
+                    for _, remaining in records_to_process[i + 1:]:
                         remaining.result = "Cancelled"
                         remaining.action_taken = "Cancelled"
                         results.append(remaining)
                     break
 
-                self.after(0, lambda r=rec, ii=i: (
+                self.after(0, lambda r=rec, ii=i, oi=orig_idx: (
                     self.status_label.configure(
                         text=f"Processing file {ii+1} of {total}: {r.filename}"
-                    )
+                    ),
+                    self.table.update_row_status(oi, "Processing...")
                 ))
 
                 process_record(rec, crf, tmp_dir)
                 processed += 1
                 results.append(rec)
 
+                self.after(0, lambda oi=orig_idx, r=rec:
+                           self.table.update_row_status(oi, r.status, r.result))
+
                 elapsed = time.time() - start_time
                 eta_str = ""
                 if processed > 0:
                     avg = elapsed / processed
-                    remaining = avg * (total - processed)
+                    remaining_secs = avg * (total - processed)
                     eta_str = (
                         f"Elapsed: {int(elapsed//60)}m {int(elapsed%60)}s — "
-                        f"Estimated remaining: ~{int(remaining//60)}m {int(remaining%60)}s"
+                        f"Estimated remaining: ~{int(remaining_secs//60)}m {int(remaining_secs%60)}s"
                     )
 
                 prog = processed / total if total > 0 else 1
