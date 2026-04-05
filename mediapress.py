@@ -390,15 +390,29 @@ def determine_status(record: FileRecord, output_folder: Path, skip_existing: boo
         record.action_taken = "Skipped (unsupported)"
         return
 
+    # Motion photo video rows always attempt compression, even if probe failed
+    if record.is_motion_video_row:
+        out_rel = Path(record.rel_path).with_name(Path(record.rel_path).stem + "_video.mp4")
+        record.output_path = output_folder / out_rel
+        if skip_existing and record.output_path.exists():
+            record.status = "Will skip (output exists)"
+            record.action_taken = "Skipped (output exists)"
+            return
+        if info is None:
+            # Probe failed — still compress, we'll figure it out at extraction time
+            record.status = "Will compress"
+            record.action_taken = "Compressed"
+        else:
+            _determine_video_status(record, info)
+        return
+
     if info is None:
         record.status = "Unsupported — skip"
         record.action_taken = "Skipped (unsupported)"
         return
 
     # Determine output path
-    if record.is_motion_video_row:
-        out_rel = Path(record.rel_path).with_name(Path(record.rel_path).stem + "_video.mp4")
-    elif record.file_type == "Video":
+    if record.file_type == "Video":
         out_rel = Path(record.rel_path).with_suffix(".mp4")
     else:  # Audio
         out_rel = Path(record.rel_path).with_suffix(".mp3")
@@ -411,7 +425,7 @@ def determine_status(record: FileRecord, output_folder: Path, skip_existing: boo
         record.action_taken = "Skipped (output exists)"
         return
 
-    if record.file_type == "Video" or record.is_motion_video_row:
+    if record.file_type == "Video":
         _determine_video_status(record, info)
     elif record.file_type == "Audio":
         _determine_audio_status(record, info)
@@ -718,6 +732,20 @@ def build_ffmpeg_audio_cmd(input_path, output_path):
     ]
 
 
+def build_ffmpeg_gif_cmd(input_path, output_path):
+    """Build a two-pass palette GIF compression command."""
+    filter_complex = (
+        "split[s0][s1];"
+        "[s0]palettegen=max_colors=256:reserve_transparent=1[p];"
+        "[s1][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle"
+    )
+    return [
+        "ffmpeg", "-loglevel", "error", "-i", str(input_path),
+        "-filter_complex", filter_complex,
+        "-y", str(output_path)
+    ]
+
+
 def run_ffmpeg(cmd):
     """Run ffmpeg, return (success, stderr)."""
     try:
@@ -801,18 +829,15 @@ def process_record(record: FileRecord, crf: int, tmp_dir: Path):
             success, stderr = run_ffmpeg(cmd)
         elif action == "Compressed":
             if record.file_type == "Motion Photo (video)":
-                # Simpler command for extracted motion photo videos — no metadata
-                # mapping or scale filter which can fail on bare extracted MP4s
-                has_audio = info.get("has_audio") if info else False
+                # Extracted motion photo MP4 can have 2 video streams (video + embedded still).
+                # Force selection of the first (shortest) video stream only.
                 cmd = [
-                    "ffmpeg", "-loglevel", "error",
+                    "ffmpeg", "-loglevel", "warning",
                     "-i", str(input_for_ffmpeg),
+                    "-map", "0:v:0",  # first video stream only
                     "-c:v", "libx264", "-crf", str(crf), "-preset", "medium",
+                    "-an",
                 ]
-                if has_audio:
-                    cmd += ["-c:a", "aac", "-b:a", "128k"]
-                else:
-                    cmd += ["-an"]
                 if record.rotation != "None":
                     rotate_map = {
                         "90° Clockwise": "transpose=1",
@@ -879,7 +904,7 @@ def process_record(record: FileRecord, crf: int, tmp_dir: Path):
 
         else:
             record.result = "Failed"
-            record.error_message = stderr[-500:] if len(stderr) > 500 else stderr
+            record.error_message = stderr[-2000:] if len(stderr) > 2000 else stderr
             if record.output_path.exists():
                 try:
                     record.output_path.unlink()
@@ -1817,7 +1842,11 @@ class MediaPressApp(ctk.CTk):
                 pct = f"{r.size_reduction_pct:.1f}% smaller" if r.size_reduction_pct > 0 else "same size"
                 status_line += f"  ({r.original_size_mb:.1f} MB → {r.output_size_mb:.1f} MB, {pct})"
             elif r.result == "Failed":
-                status_line += f"  ERROR: {r.error_message[:80]}"
+                if r.error_message:
+                    for line in r.error_message.splitlines():
+                        lines.append(f"             {line}")
+                else:
+                    status_line += "  (no error detail)"
             lines.append(status_line)
 
         lines.append(f"{'='*60}")
