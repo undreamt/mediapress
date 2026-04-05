@@ -850,11 +850,18 @@ def process_record(record: FileRecord, crf: int, tmp_dir: Path):
                 success, stderr = run_ffmpeg(cmd)
                 record.crf_used = str(crf)
             elif record.file_type == "GIF":
-                # Convert GIF to H.264 MP4 — far smaller than palette-optimised GIF
+                # Convert GIF to H.264 MP4 with embedded thumbnail (first frame).
+                # split feeds two paths: H.264 video + MJPEG attached_pic thumbnail.
+                filter_complex = (
+                    "[0:v]split=2[vid][th];"
+                    "[vid]scale=trunc(iw/2)*2:trunc(ih/2)*2[v];"
+                    "[th]select=eq(n\\,0),scale=trunc(iw/2)*2:trunc(ih/2)*2[t]"
+                )
                 cmd = [
                     "ffmpeg", "-loglevel", "error", "-i", str(input_for_ffmpeg),
-                    "-c:v", "libx264", "-crf", str(crf), "-preset", "medium",
-                    "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",  # ensure even dimensions
+                    "-filter_complex", filter_complex,
+                    "-map", "[v]", "-c:v", "libx264", "-crf", str(crf), "-preset", "medium",
+                    "-map", "[t]", "-c:v:1", "mjpeg", "-disposition:v:1", "attached_pic",
                     "-an", "-movflags", "+faststart", "-y", str(record.output_path)
                 ]
                 success, stderr = run_ffmpeg(cmd)
