@@ -1,1 +1,6 @@
 ﻿mediapress_settings.json
+__pycache__/
+*.pyc
+test/input/
+test/output/
+test/logs/
