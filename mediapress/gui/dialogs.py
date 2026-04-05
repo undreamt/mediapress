@@ -4,6 +4,10 @@ import customtkinter as ctk
 import tkinter as tk
 
 from .. import APP_NAME, APP_VERSION
+from ..platform_compat import (
+    get_ui_font, get_ffmpeg_install_hint, get_ffmpeg_setup_text,
+    get_python_setup_text, get_quickstart_text, get_troubleshooting_text,
+)
 
 
 class ToolTip:
@@ -25,7 +29,7 @@ class ToolTip:
         label = tk.Label(tw, text=self.text, justify="left",
                          background="#333333", foreground="white",
                          relief="solid", borderwidth=1,
-                         font=("Segoe UI", 9),
+                         font=(get_ui_font(), 9),
                          wraplength=300, padx=6, pady=4)
         label.pack()
 
@@ -83,31 +87,13 @@ class HelpWindow(ctk.CTkToplevel):
 
         head("1. PYTHON 3.10 OR NEWER")
         status_lbl("python")
-        body(
-            "How to install:\n"
-            "  • Option A (Recommended): https://www.python.org/downloads/\n"
-            "    During install, CHECK 'Add Python to PATH' — this is critical.\n"
-            "  • Option B: Microsoft Store → search 'Python 3.12'\n\n"
-            "Verify: open PowerShell and run:  python --version"
-        )
+        body(get_python_setup_text())
         sep()
 
         head("2. FFMPEG & FFPROBE")
         status_lbl("ffmpeg")
         status_lbl("ffprobe")
-        body(
-            "Method A — winget (easiest, built into Windows 11):\n"
-            "  winget install Gyan.FFmpeg\n"
-            "  Then restart PowerShell and MediaPress.\n\n"
-            "Method B — Manual:\n"
-            "  1. Download from https://www.gyan.dev/ffmpeg/builds/\n"
-            "     → 'ffmpeg-release-essentials.zip' under 'release builds'\n"
-            "  2. Extract and move folder to e.g. C:\\ffmpeg\n"
-            "  3. Add C:\\ffmpeg\\bin to Windows PATH:\n"
-            "     Win+S → 'Environment Variables' → System variables → Path → Edit → New\n"
-            "  4. Restart PowerShell and MediaPress\n\n"
-            "Verify: ffmpeg -version  and  ffprobe -version"
-        )
+        body(get_ffmpeg_setup_text())
         sep()
 
         head("3. CUSTOMTKINTER (Python package)")
@@ -120,23 +106,11 @@ class HelpWindow(ctk.CTkToplevel):
         sep()
 
         head("QUICK START (once all dependencies installed)")
-        body(
-            "  cd C:\\path\\to\\mediapress\n"
-            "  python mediapress.py"
-        )
+        body(get_quickstart_text())
         sep()
 
         head("TROUBLESHOOTING")
-        body(
-            "'FFmpeg not found' after installing:\n"
-            "  → Restart PowerShell after changing PATH. Confirm with: ffmpeg -version\n\n"
-            "'python is not recognised':\n"
-            "  → Reinstall Python and check 'Add Python to PATH' on the first screen.\n\n"
-            "'pip is not recognised':\n"
-            "  → Use: python -m pip install customtkinter\n\n"
-            "Scan/Run buttons are greyed out:\n"
-            "  → See the yellow warning banner. Open Help → Setup Guide."
-        )
+        body(get_troubleshooting_text())
 
         close_btn = ctk.CTkButton(frame, text="Close", command=self.destroy, width=100)
         close_btn.pack(pady=(16, 4))
@@ -202,9 +176,10 @@ class DependencyErrorDialog(ctk.CTkToplevel):
                      font=ctk.CTkFont(size=12)).pack()
 
         for k, v in missing.items():
+            ffmpeg_hint = get_ffmpeg_install_hint()
             fix_map = {
-                "ffmpeg": "Install FFmpeg: winget install Gyan.FFmpeg",
-                "ffprobe": "Install FFmpeg (includes ffprobe): winget install Gyan.FFmpeg",
+                "ffmpeg": ffmpeg_hint,
+                "ffprobe": ffmpeg_hint.replace("FFmpeg:", "FFmpeg (includes ffprobe):"),
                 "customtkinter": "Run: pip install customtkinter",
             }
             lbl = ctk.CTkLabel(frame,

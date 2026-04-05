@@ -5,6 +5,7 @@ import tkinter as tk
 import tkinter.ttk as ttk
 
 from ..constants import ROTATE_OPTIONS
+from ..platform_compat import get_ui_font
 from ..scanner import _determine_video_status
 
 COL_IDS    = ["include", "num", "filename", "relpath", "filetype",
@@ -37,12 +38,12 @@ def _apply_treeview_theme(tree_widget):
                     fieldbackground=bg,
                     rowheight=26,
                     borderwidth=0,
-                    font=("Segoe UI", 10))
+                    font=(get_ui_font(), 10))
     style.configure("MediaPress.Treeview.Heading",
                     background=hdr_bg,
                     foreground=fg,
                     relief="flat",
-                    font=("Segoe UI", 10, "bold"))
+                    font=(get_ui_font(), 10, "bold"))
     style.map("MediaPress.Treeview",
               background=[("selected", sel_bg)],
               foreground=[("selected", "white")])
