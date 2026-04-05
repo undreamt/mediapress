@@ -4,7 +4,7 @@ import sys
 import subprocess
 
 
-def check_dependencies():
+def check_dependencies(include_gui=True):
     """Returns a dict with dependency status info."""
     results = {}
 
@@ -45,33 +45,48 @@ def check_dependencies():
     except Exception:
         results["ffprobe"] = {"found": False, "version": None, "display": "FFprobe"}
 
-    # CustomTkinter
-    try:
-        import customtkinter
-        ver = getattr(customtkinter, "__version__", "unknown")
-        results["customtkinter"] = {"found": True, "version": ver, "display": f"CustomTkinter {ver}"}
-    except ImportError:
-        results["customtkinter"] = {"found": False, "version": None, "display": "CustomTkinter"}
+    # CustomTkinter (only check for GUI mode)
+    if include_gui:
+        try:
+            import customtkinter
+            ver = getattr(customtkinter, "__version__", "unknown")
+            results["customtkinter"] = {"found": True, "version": ver, "display": f"CustomTkinter {ver}"}
+        except ImportError:
+            results["customtkinter"] = {"found": False, "version": None, "display": "CustomTkinter"}
 
     return results
 
 
+def _is_cli_invocation():
+    """Check if we should run in CLI mode based on argv."""
+    # No args or just --gui → GUI mode
+    if len(sys.argv) <= 1:
+        return False
+    if sys.argv[1] == "--gui":
+        return False
+    return True
+
+
 def main():
-    dep_results = check_dependencies()
+    if _is_cli_invocation():
+        from .cli import cli_main
+        sys.exit(cli_main())
+    else:
+        dep_results = check_dependencies(include_gui=True)
 
-    from .gui.app import MediaPressApp
-    from .gui.dialogs import HelpWindow, DependencyErrorDialog
+        from .gui.app import MediaPressApp
+        from .gui.dialogs import HelpWindow, DependencyErrorDialog
 
-    app = MediaPressApp(dep_results)
+        app = MediaPressApp(dep_results)
 
-    missing = [k for k, v in dep_results.items() if k != "python" and not v.get("found")]
-    if missing:
-        def open_guide():
-            HelpWindow(app, dep_results)
+        missing = [k for k, v in dep_results.items() if k != "python" and not v.get("found")]
+        if missing:
+            def open_guide():
+                HelpWindow(app, dep_results)
 
-        app.after(200, lambda: DependencyErrorDialog(app, dep_results, open_guide))
+            app.after(200, lambda: DependencyErrorDialog(app, dep_results, open_guide))
 
-    app.mainloop()
+        app.mainloop()
 
 
 if __name__ == "__main__":
