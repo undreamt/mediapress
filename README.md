@@ -1,10 +1,10 @@
 # MediaPress — Media Compression Tool
 
-A Windows 11 desktop application for compressing video and audio files to efficient storage parameters. It scans an input folder, re-encodes files using FFmpeg, and writes compressed copies to an output folder — mirroring the folder structure exactly. Source files are never modified.
+A cross-platform desktop application for compressing video and audio files to efficient storage parameters. It scans an input folder, re-encodes files using FFmpeg, and writes compressed copies to an output folder — mirroring the folder structure exactly. Source files are never modified.
 
 ## Requirements
 
-- Windows 10/11
+- **Windows 10+**, **macOS 12+**, or **Linux**
 - Python 3.10 or newer
 - FFmpeg & FFprobe (on PATH)
 - CustomTkinter (Python package)
@@ -15,29 +15,54 @@ A Windows 11 desktop application for compressing video and audio files to effici
 
 ### 1. Install Python
 
-Download from [python.org/downloads](https://www.python.org/downloads/).
+**macOS:**
+```
+brew install python
+```
+Or download from [python.org/downloads](https://www.python.org/downloads/).
 
+**Linux (Debian/Ubuntu):**
+```
+sudo apt install python3 python3-pip python3-tk
+```
+
+**Windows:**
+Download from [python.org/downloads](https://www.python.org/downloads/).
 **Important:** On the first install screen, check **"Add Python to PATH"**.
 
-Verify: open PowerShell and run:
+Verify:
 ```
-python --version
+python3 --version
 ```
 
 ### 2. Install FFmpeg
 
-**Option A — winget (easiest, built into Windows 11):**
+**macOS:**
+```
+brew install ffmpeg
+```
+
+**Linux (Debian/Ubuntu):**
+```
+sudo apt update && sudo apt install ffmpeg
+```
+
+**Linux (Fedora):**
+```
+sudo dnf install ffmpeg
+```
+
+**Windows — winget (easiest, built into Windows 11):**
 ```
 winget install Gyan.FFmpeg
 ```
-Restart PowerShell after installing.
 
-**Option B — Manual:**
+**Windows — Manual:**
 1. Download from [gyan.dev/ffmpeg/builds](https://www.gyan.dev/ffmpeg/builds/) → `ffmpeg-release-essentials.zip`
 2. Extract and move the folder to e.g. `C:\ffmpeg`
 3. Add `C:\ffmpeg\bin` to your Windows PATH:
    - `Win+S` → "Environment Variables" → System variables → Path → Edit → New
-4. Restart PowerShell
+4. Restart your terminal
 
 Verify:
 ```
@@ -53,7 +78,7 @@ pip install customtkinter
 
 If `pip` is not found:
 ```
-python -m pip install customtkinter
+python3 -m pip install customtkinter
 ```
 
 ---
@@ -61,11 +86,14 @@ python -m pip install customtkinter
 ## Running MediaPress
 
 ```
-cd C:\path\to\mediapress
-python mediapress.py
+cd /path/to/mediapress
+python3 mediapress.py
 ```
 
-Or double-click `mediapress.py` if Python is associated with `.py` files.
+Or run as a Python package:
+```
+python3 -m mediapress
+```
 
 ---
 
@@ -91,3 +119,8 @@ Or double-click `mediapress.py` if Python is associated with `.py` files.
 **GIF:** `.gif` (converted to H.264 MP4)
 
 **Motion Photos:** `.jpg`, `.jpeg` (Google Pixel / Android moving picture format — extracted to MP4)
+
+## Utilities
+
+- `create_shortcut.ps1` — Windows-only: creates a desktop shortcut (PowerShell)
+- `diagnose_motionphoto.ps1` — Windows-only: debug tool for motion photo extraction (PowerShell)
