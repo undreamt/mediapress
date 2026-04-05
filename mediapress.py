@@ -637,8 +637,8 @@ def scan_folder(input_folder: Path, output_folder: Path, skip_existing: bool, cr
             else:
                 rec.resolution = "—"
 
-            # Output stays .gif — same relative path, same extension
-            rec.output_path = output_folder / rel
+            # GIFs are converted to MP4 for much better compression
+            rec.output_path = output_folder / Path(str(rel)).with_suffix(".mp4")
             if skip_existing and rec.output_path.exists():
                 rec.status = "Will skip (output exists)"
                 rec.action_taken = "Skipped (output exists)"
@@ -728,20 +728,6 @@ def build_ffmpeg_audio_cmd(input_path, output_path):
         "-c:a", "libmp3lame",
         "-b:a", "128k",
         "-map_metadata", "0",
-        "-y", str(output_path)
-    ]
-
-
-def build_ffmpeg_gif_cmd(input_path, output_path):
-    """Build a two-pass palette GIF compression command."""
-    filter_complex = (
-        "split[s0][s1];"
-        "[s0]palettegen=max_colors=256:reserve_transparent=1[p];"
-        "[s1][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle"
-    )
-    return [
-        "ffmpeg", "-loglevel", "error", "-i", str(input_path),
-        "-filter_complex", filter_complex,
         "-y", str(output_path)
     ]
 
@@ -864,9 +850,15 @@ def process_record(record: FileRecord, crf: int, tmp_dir: Path):
                 success, stderr = run_ffmpeg(cmd)
                 record.crf_used = str(crf)
             elif record.file_type == "GIF":
-                cmd = build_ffmpeg_gif_cmd(input_for_ffmpeg, record.output_path)
+                # Convert GIF to H.264 MP4 — far smaller than palette-optimised GIF
+                cmd = [
+                    "ffmpeg", "-loglevel", "error", "-i", str(input_for_ffmpeg),
+                    "-c:v", "libx264", "-crf", str(crf), "-preset", "medium",
+                    "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",  # ensure even dimensions
+                    "-an", "-movflags", "+faststart", "-y", str(record.output_path)
+                ]
                 success, stderr = run_ffmpeg(cmd)
-                record.output_format = "GIF"
+                record.crf_used = str(crf)
             else:  # Audio
                 cmd = build_ffmpeg_audio_cmd(input_for_ffmpeg, record.output_path)
                 success, stderr = run_ffmpeg(cmd)
@@ -892,10 +884,8 @@ def process_record(record: FileRecord, crf: int, tmp_dir: Path):
                         record.size_reduction_pct = (
                             1 - record.output_size_mb / record.original_size_mb
                         ) * 100
-                if record.file_type in ("Video", "Motion Photo (video)"):
+                if record.file_type in ("Video", "Motion Photo (video)", "GIF"):
                     record.output_format = "H.264 / MP4"
-                elif record.file_type == "GIF":
-                    record.output_format = "GIF"
                 else:
                     record.output_format = "MP3"
                 if info:
