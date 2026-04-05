@@ -1,7 +1,5 @@
 """Main application window."""
 
-import shutil
-import tempfile
 import threading
 import time
 from datetime import datetime
@@ -14,7 +12,8 @@ import tkinter as tk
 from .. import APP_NAME
 from ..settings import load_settings, save_settings
 from ..scanner import scan_folder
-from ..processor import process_record
+from ..processor import process_records
+from ..encoder import get_best_encoder, get_encoder_label
 from ..report import generate_text_report, write_csv_report
 from .dialogs import ToolTip, HelpWindow, AboutWindow, DependencyErrorDialog
 from .table import FileTableWidget
@@ -351,6 +350,7 @@ class MediaPressApp(ctk.CTk):
         self._clear_report()
 
         crf = self.crf_var.get()
+        encoder = get_best_encoder()
         # Read from table.records — same objects the checkbox handler mutates
         source = self.table.records if self.table.records else self.records
         records_to_process = [
@@ -361,57 +361,39 @@ class MediaPressApp(ctk.CTk):
         total = len(records_to_process)
         start_time = time.time()
 
+        encoder_label = get_encoder_label(encoder)
+        self.status_label.configure(text=f"Starting ({encoder_label})...")
+
+        def on_progress(orig_idx, rec, i, total_count):
+            processed = i + 1
+            elapsed = time.time() - start_time
+            eta_str = ""
+            if processed > 0:
+                avg = elapsed / processed
+                remaining_secs = avg * (total_count - processed)
+                eta_str = (
+                    f"Elapsed: {int(elapsed//60)}m {int(elapsed%60)}s — "
+                    f"Estimated remaining: ~{int(remaining_secs//60)}m {int(remaining_secs%60)}s"
+                )
+            prog = processed / total_count if total_count > 0 else 1
+
+            self.after(0, lambda oi=orig_idx, r=rec, p=prog, e=eta_str, ii=processed: (
+                self.table.update_row_status(oi, r.status, r.result),
+                self.status_label.configure(
+                    text=f"Processed {ii}/{total_count}: {r.filename}"
+                ),
+                self.progress_bar.set(p),
+                self.eta_label.configure(text=e),
+            ))
+
         def run_thread():
-            tmp_dir = Path(tempfile.mkdtemp(prefix="mediapress_"))
-            processed = 0
-            results = []
-
-            for i, (orig_idx, rec) in enumerate(records_to_process):
-                if self.cancel_event.is_set():
-                    rec.result = "Cancelled"
-                    rec.action_taken = "Cancelled"
-                    results.append(rec)
-                    for _, remaining in records_to_process[i + 1:]:
-                        remaining.result = "Cancelled"
-                        remaining.action_taken = "Cancelled"
-                        results.append(remaining)
-                    break
-
-                self.after(0, lambda r=rec, ii=i, oi=orig_idx: (
-                    self.status_label.configure(
-                        text=f"Processing file {ii+1} of {total}: {r.filename}"
-                    ),
-                    self.table.update_row_status(oi, "Processing...")
-                ))
-
-                process_record(rec, crf, tmp_dir)
-                processed += 1
-                results.append(rec)
-
-                self.after(0, lambda oi=orig_idx, r=rec:
-                           self.table.update_row_status(oi, r.status, r.result))
-
-                elapsed = time.time() - start_time
-                eta_str = ""
-                if processed > 0:
-                    avg = elapsed / processed
-                    remaining_secs = avg * (total - processed)
-                    eta_str = (
-                        f"Elapsed: {int(elapsed//60)}m {int(elapsed%60)}s — "
-                        f"Estimated remaining: ~{int(remaining_secs//60)}m {int(remaining_secs%60)}s"
-                    )
-
-                prog = processed / total if total > 0 else 1
-                self.after(0, lambda p=prog, e=eta_str: (
-                    self.progress_bar.set(p),
-                    self.eta_label.configure(text=e)
-                ))
-
-            try:
-                shutil.rmtree(str(tmp_dir), ignore_errors=True)
-            except Exception:
-                pass
-
+            results = process_records(
+                records_to_process, crf,
+                encoder=encoder,
+                progress_callback=on_progress,
+                cancel_event=self.cancel_event,
+            )
+            processed = sum(1 for r in results if r.result != "Cancelled")
             cancelled = self.cancel_event.is_set()
             self.after(0, lambda r=results, p=processed, t=total, c=cancelled:
                        self._on_run_done(r, p, t, c))
