@@ -71,11 +71,12 @@ Or double-click `mediapress.py` if Python is associated with `.py` files.
 
 ## Features
 
-- Scans input folders recursively for video, audio, and motion photo files
+- Scans input folders recursively for video, audio, GIF, and motion photo files
 - Smart compression decisions: compress, remux, copy, or skip based on codec/bitrate/container
 - Video compression: H.264 / MP4, CRF-controlled quality (default 23)
+- GIF conversion: converts animated GIFs to H.264 MP4 for dramatically smaller output
 - Audio compression: MP3 128kbps with full ID3 tag preservation
-- Motion Photo support: detects and splits Google Pixel motion photos into still + video
+- Motion Photo support: detects and extracts Google Pixel motion photos to compressed MP4
 - Rotation correction: per-file dropdown (none / 90° CW / 90° CCW / 180°)
 - Skip existing files: resume interrupted runs without re-processing
 - CSV report: full per-file report saved to the output folder
@@ -87,4 +88,6 @@ Or double-click `mediapress.py` if Python is associated with `.py` files.
 
 **Audio:** `.mp3`, `.wav`, `.flac`, `.aac`, `.m4a`, `.ogg`, `.wma`, `.opus`
 
-**Motion Photos:** `.jpg`, `.jpeg` (Google Pixel / Android moving picture format)
+**GIF:** `.gif` (converted to H.264 MP4)
+
+**Motion Photos:** `.jpg`, `.jpeg` (Google Pixel / Android moving picture format — extracted to MP4)
