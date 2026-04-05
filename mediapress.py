@@ -33,6 +33,7 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".m4v", ".wmv", ".3gp",
                     ".flv", ".webm", ".ts", ".mts", ".m2ts"}
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".flac", ".aac", ".m4a", ".ogg", ".wma", ".opus"}
 PHOTO_EXTENSIONS = {".jpg", ".jpeg"}
+GIF_EXTENSIONS   = {".gif"}
 
 ROTATE_OPTIONS = ["None", "90° Clockwise", "90° Counter-clockwise", "180°"]
 
@@ -763,12 +764,16 @@ def process_record(record: FileRecord, crf: int, tmp_dir: Path):
                 else:
                     # Fallback basic compress
                     cmd = [
-                        "ffmpeg", "-i", str(input_for_ffmpeg),
+                        "ffmpeg", "-loglevel", "error", "-i", str(input_for_ffmpeg),
                         "-c:v", "libx264", "-crf", str(crf),
                         "-preset", "medium", "-y", str(record.output_path)
                     ]
                 success, stderr = run_ffmpeg(cmd)
                 record.crf_used = str(crf)
+            elif record.file_type == "GIF":
+                cmd = build_ffmpeg_gif_cmd(input_for_ffmpeg, record.output_path)
+                success, stderr = run_ffmpeg(cmd)
+                record.output_format = "GIF"
             else:  # Audio
                 cmd = build_ffmpeg_audio_cmd(input_for_ffmpeg, record.output_path)
                 success, stderr = run_ffmpeg(cmd)
@@ -794,7 +799,12 @@ def process_record(record: FileRecord, crf: int, tmp_dir: Path):
                         record.size_reduction_pct = (
                             1 - record.output_size_mb / record.original_size_mb
                         ) * 100
-                record.output_format = "H.264 / MP4" if record.file_type in ("Video", "Motion Photo (video)") else "MP3"
+                if record.file_type in ("Video", "Motion Photo (video)"):
+                    record.output_format = "H.264 / MP4"
+                elif record.file_type == "GIF":
+                    record.output_format = "GIF"
+                else:
+                    record.output_format = "MP3"
                 if info:
                     record.output_resolution = format_resolution(info)
                     record.output_bitrate = "128 kbps (audio)"
@@ -1073,16 +1083,20 @@ def _apply_treeview_theme(tree_widget):
         tree_widget.tag_configure("remux",     foreground="#4090d0")
         tree_widget.tag_configure("skip",      foreground="#aaaaaa")
         tree_widget.tag_configure("unsupport", foreground="#666666")
+        tree_widget.tag_configure("dim",       foreground="#555555")
     except Exception:
         pass
 
 
-class FileTableWidget(ctk.CTkFrame):
+class FileTableWidget(tk.Frame):
     """Treeview-based file table — fast, properly aligned, resizable columns."""
 
     def __init__(self, parent, **kwargs):
+        # Use plain tk.Frame to avoid CTk canvas redraws on every window resize
+        kwargs.pop("fg_color", None)
         super().__init__(parent, **kwargs)
         self.records = []
+        self._iid_to_idx = {}           # iid string → index into self.records
         self._on_rotate_change = None   # callback set by MediaPressApp
         self._overlay = None            # floating CTkOptionMenu for rotate
         self._build_ui()
@@ -1098,7 +1112,7 @@ class FileTableWidget(ctk.CTkFrame):
             container,
             columns=COL_IDS,
             show="headings",
-            selectmode="extended",
+            selectmode="none",
             style="MediaPress.Treeview",
         )
 
@@ -1112,14 +1126,12 @@ class FileTableWidget(ctk.CTkFrame):
 
         for col_id, col_name, width in zip(COL_IDS, COLUMNS, COL_WIDTHS):
             self.tree.heading(col_id, text=col_name, anchor="w")
-            stretch = col_id not in ("include", "num")
-            self.tree.column(col_id, width=width, minwidth=36, stretch=stretch, anchor="w")
+            self.tree.column(col_id, width=width, minwidth=36, stretch=False, anchor="w")
 
         _apply_treeview_theme(self.tree)
 
         self.tree.bind("<ButtonPress-1>", self._on_click)
         self.tree.bind("<MouseWheel>", self._dismiss_overlay)
-        self.tree.bind("<Configure>", self._dismiss_overlay)
 
     def _status_tag(self, status):
         s = status.lower()
@@ -1140,11 +1152,13 @@ class FileTableWidget(ctk.CTkFrame):
         for iid in self.tree.get_children():
             self.tree.delete(iid)
         self.records = []
+        self._iid_to_idx = {}   # iid string → index into self.records
 
     def load_records(self, records):
         self.clear()
         self.records = list(records)
         for idx, rec in enumerate(self.records):
+            self._iid_to_idx[str(idx)] = idx
             self._insert_row(idx, rec)
 
     def _insert_row(self, idx, rec: FileRecord):
@@ -1179,14 +1193,19 @@ class FileTableWidget(ctk.CTkFrame):
             self._dismiss_overlay()
             return
 
-        idx = int(row)
-        if idx >= len(self.records):
+        idx = self._iid_to_idx.get(row)
+        if idx is None or idx >= len(self.records):
             return
         rec = self.records[idx]
 
         if col == "#1":      # Include column
             rec.enabled = not rec.enabled
             self.tree.set(row, "include", "☑" if rec.enabled else "☐")
+            # Dim excluded rows so the visual state is unambiguous
+            base_tag = "even" if idx % 2 == 0 else "odd"
+            st = self._status_tag(rec.status)
+            dim = () if rec.enabled else ("dim",)
+            self.tree.item(row, tags=(base_tag, st) + dim if st else (base_tag,) + dim)
             if self._on_rotate_change:
                 self._on_rotate_change()
 
@@ -1608,9 +1627,11 @@ class MediaPressApp(ctk.CTk):
         self._clear_report()
 
         crf = self.crf_var.get()
+        # Read from table.records — same objects the checkbox handler mutates
+        source = self.table.records if self.table.records else self.records
         records_to_process = [
             (orig_idx, r)
-            for orig_idx, r in enumerate(self.records)
+            for orig_idx, r in enumerate(source)
             if r.enabled and r.status not in ("Unsupported — skip",)
         ]
         total = len(records_to_process)
