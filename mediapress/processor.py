@@ -1,16 +1,23 @@
 """FFmpeg command building and file processing."""
 
+import os
 import shutil
 import subprocess
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from .models import FileRecord
 from .probe import format_resolution
 from .motion import align_to_ftyp
+from .encoder import get_best_encoder, build_encoder_args
 
 
-def build_ffmpeg_video_cmd(input_path, output_path, info, crf, rotation):
+def build_ffmpeg_video_cmd(input_path, output_path, info, crf, rotation, encoder=None):
     """Build the ffmpeg command for video compression."""
+    if encoder is None:
+        encoder = get_best_encoder()
+
     w = info.get("width") or 0
     h = info.get("height") or 0
 
@@ -27,12 +34,8 @@ def build_ffmpeg_video_cmd(input_path, output_path, info, crf, rotation):
     rotate_filter = rotate_map.get(rotation, "")
     vf = scale + rotate_filter
 
-    cmd = [
-        "ffmpeg", "-loglevel", "error", "-i", str(input_path),
-        "-c:v", "libx264",
-        "-crf", str(crf),
-        "-preset", "medium",
-    ]
+    cmd = ["ffmpeg", "-loglevel", "error", "-i", str(input_path)]
+    cmd += build_encoder_args(encoder, crf)
 
     if info.get("has_audio"):
         cmd += ["-c:a", "aac", "-b:a", "128k"]
@@ -81,7 +84,7 @@ def run_ffmpeg(cmd):
         return False, str(e)
 
 
-def process_record(record: FileRecord, crf: int, tmp_dir: Path):
+def process_record(record: FileRecord, crf: int, tmp_dir: Path, encoder=None):
     """Process a single FileRecord. Returns updated record."""
     try:
         orig_size = record.filepath.stat().st_size
@@ -153,6 +156,9 @@ def process_record(record: FileRecord, crf: int, tmp_dir: Path):
             cmd = build_ffmpeg_remux_cmd(input_for_ffmpeg, record.output_path)
             success, stderr = run_ffmpeg(cmd)
         elif action == "Compressed":
+            if encoder is None:
+                encoder = get_best_encoder()
+
             if record.file_type == "Motion Photo (video)":
                 # Extracted motion photo MP4 can have 2 video streams (video + embedded still).
                 # Force selection of the first (shortest) video stream only.
@@ -160,9 +166,9 @@ def process_record(record: FileRecord, crf: int, tmp_dir: Path):
                     "ffmpeg", "-loglevel", "warning",
                     "-i", str(input_for_ffmpeg),
                     "-map", "0:v:0",  # first video stream only
-                    "-c:v", "libx264", "-crf", str(crf), "-preset", "medium",
-                    "-an",
                 ]
+                cmd += build_encoder_args(encoder, crf)
+                cmd += ["-an"]
                 if record.rotation != "None":
                     rotate_map = {
                         "90° Clockwise": "transpose=1",
@@ -178,14 +184,12 @@ def process_record(record: FileRecord, crf: int, tmp_dir: Path):
             elif record.file_type == "Video":
                 if info:
                     cmd = build_ffmpeg_video_cmd(
-                        input_for_ffmpeg, record.output_path, info, crf, record.rotation
+                        input_for_ffmpeg, record.output_path, info, crf, record.rotation, encoder
                     )
                 else:
-                    cmd = [
-                        "ffmpeg", "-loglevel", "error", "-i", str(input_for_ffmpeg),
-                        "-c:v", "libx264", "-crf", str(crf),
-                        "-preset", "medium", "-y", str(record.output_path)
-                    ]
+                    cmd = ["ffmpeg", "-loglevel", "error", "-i", str(input_for_ffmpeg)]
+                    cmd += build_encoder_args(encoder, crf)
+                    cmd += ["-y", str(record.output_path)]
                 success, stderr = run_ffmpeg(cmd)
                 record.crf_used = str(crf)
             elif record.file_type == "GIF":
@@ -195,10 +199,11 @@ def process_record(record: FileRecord, crf: int, tmp_dir: Path):
                     "[vid]scale=trunc(iw/2)*2:trunc(ih/2)*2[v];"
                     "[th]select=eq(n\\,0),scale=trunc(iw/2)*2:trunc(ih/2)*2[t]"
                 )
+                enc_args = build_encoder_args(encoder, crf)
                 cmd = [
                     "ffmpeg", "-loglevel", "error", "-i", str(input_for_ffmpeg),
                     "-filter_complex", filter_complex,
-                    "-map", "[v]", "-c:v", "libx264", "-crf", str(crf), "-preset", "medium",
+                    "-map", "[v]"] + enc_args + [
                     "-map", "[t]", "-c:v:1", "mjpeg", "-disposition:v:1", "attached_pic",
                     "-an", "-movflags", "+faststart", "-y", str(record.output_path)
                 ]
@@ -262,3 +267,95 @@ def process_record(record: FileRecord, crf: int, tmp_dir: Path):
                 pass
 
     return record
+
+
+def process_records(records, crf, workers=None, encoder=None,
+                    progress_callback=None, cancel_event=None):
+    """Process multiple records, optionally in parallel.
+
+    Args:
+        records: list of (original_index, FileRecord) tuples
+        crf: quality setting
+        workers: number of parallel workers (None = auto-detect)
+        encoder: encoder name (None = auto-detect best)
+        progress_callback: fn(orig_idx, record, i, total) called after each file
+        cancel_event: threading.Event to signal cancellation
+
+    Returns:
+        list of processed FileRecord objects
+    """
+    if workers is None:
+        workers = min(os.cpu_count() or 4, 8)
+
+    if encoder is None:
+        encoder = get_best_encoder()
+
+    total = len(records)
+    results = []
+
+    # Create temp directory tree
+    base_tmp = Path(tempfile.mkdtemp(prefix="mediapress_"))
+
+    if workers <= 1:
+        # Sequential
+        for i, (orig_idx, rec) in enumerate(records):
+            if cancel_event and cancel_event.is_set():
+                rec.result = "Cancelled"
+                rec.action_taken = "Cancelled"
+                results.append(rec)
+                for _, remaining in records[i + 1:]:
+                    remaining.result = "Cancelled"
+                    remaining.action_taken = "Cancelled"
+                    results.append(remaining)
+                break
+
+            process_record(rec, crf, base_tmp, encoder=encoder)
+            results.append(rec)
+
+            if progress_callback:
+                progress_callback(orig_idx, rec, i, total)
+    else:
+        # Parallel — each worker gets its own temp dir
+        worker_dirs = {}
+        for w in range(workers):
+            d = base_tmp / f"worker_{w}"
+            d.mkdir()
+            worker_dirs[w] = d
+
+        completed_count = 0
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {}
+            for i, (orig_idx, rec) in enumerate(records):
+                if cancel_event and cancel_event.is_set():
+                    rec.result = "Cancelled"
+                    rec.action_taken = "Cancelled"
+                    results.append(rec)
+                    continue
+
+                worker_id = i % workers
+                future = executor.submit(
+                    process_record, rec, crf, worker_dirs[worker_id], encoder
+                )
+                future_map[future] = (i, orig_idx, rec)
+
+            for future in as_completed(future_map):
+                i, orig_idx, rec = future_map[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    rec.result = "Failed"
+                    rec.error_message = str(e)
+                results.append(rec)
+                completed_count += 1
+
+                if progress_callback:
+                    progress_callback(orig_idx, rec, completed_count - 1, total)
+
+    # Cleanup
+    try:
+        shutil.rmtree(str(base_tmp), ignore_errors=True)
+    except Exception:
+        pass
+
+    return results

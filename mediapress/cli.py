@@ -1,9 +1,7 @@
 """Command-line interface for MediaPress."""
 
 import argparse
-import shutil
 import sys
-import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -30,6 +28,10 @@ def build_parser():
                         help="Scan and report but do not process")
     parser.add_argument("--dry-run", action="store_true",
                         help="Alias for --scan-only")
+    parser.add_argument("--workers", type=int, default=None,
+                        help="Number of parallel workers (default: auto-detect from CPU cores)")
+    parser.add_argument("--encoder", type=str, default=None,
+                        help="Video encoder (default: auto-detect best available)")
     parser.add_argument("--csv-report", type=Path, default=None,
                         help="Save CSV report to this path (default: output_folder/compression_report_*.csv)")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -82,8 +84,23 @@ def cli_main(args=None):
 
     # Import here to keep startup fast
     from .scanner import scan_folder
-    from .processor import process_record
+    from .processor import process_records
+    from .encoder import get_best_encoder, get_encoder_label, detect_available_encoders
     from .report import generate_text_report, write_csv_report
+
+    # Detect encoder
+    encoder = args.encoder
+    if encoder is None:
+        encoder = get_best_encoder()
+    workers = args.workers
+
+    if args.verbose:
+        import os as _os
+        avail = detect_available_encoders()
+        print(f"  Encoder:  {encoder} ({get_encoder_label(encoder)})")
+        print(f"  Available: {', '.join(f'{n} ({l})' for n, l in avail)}")
+        print(f"  Workers:  {workers or f'auto ({min(_os.cpu_count() or 4, 8)})'}")
+        print()
 
     scan_only = args.scan_only or args.dry_run
 
@@ -130,38 +147,35 @@ def cli_main(args=None):
         return 0
 
     # Phase 2: Process
-    actionable = [r for r in records if r.status not in ("Unsupported — skip",)]
+    actionable = [(i, r) for i, r in enumerate(records) if r.status not in ("Unsupported — skip",)]
     if not actionable:
         print("No files to process.")
         return 0
 
     total = len(actionable)
-    print(f"Processing {total} files ...")
-    tmp_dir = Path(tempfile.mkdtemp(prefix="mediapress_"))
+    print(f"Processing {total} files (encoder: {get_encoder_label(encoder)}, "
+          f"workers: {workers or 'auto'}) ...")
+
     process_start = time.perf_counter()
-    results = []
 
-    for i, rec in enumerate(actionable):
-        file_start = time.perf_counter()
-        sys.stdout.write(f"\r  [{i+1}/{total}] {rec.filename[:55]:<55s}")
-        sys.stdout.flush()
-
-        process_record(rec, args.crf, tmp_dir)
-        file_elapsed = time.perf_counter() - file_start
-        results.append(rec)
-
+    def on_progress(orig_idx, rec, i, total_count):
         if args.verbose:
-            sys.stdout.write(f"\r  [{i+1}/{total}] {rec.result:8s} {rec.filename:35s} "
-                             f"{rec.original_size_mb:.1f}→{rec.output_size_mb:.1f}MB "
-                             f"({file_elapsed:.1f}s)\n")
+            sys.stdout.write(f"  [{i+1}/{total_count}] {rec.result:8s} {rec.filename:35s} "
+                             f"{rec.original_size_mb:.1f}→{rec.output_size_mb:.1f}MB\n")
         elif rec.result == "Failed":
-            sys.stdout.write(f"\r  [{i+1}/{total}] FAILED: {rec.filename} — {rec.error_message[:80]}\n")
+            sys.stdout.write(f"  [{i+1}/{total_count}] FAILED: {rec.filename} — {rec.error_message[:80]}\n")
+        else:
+            sys.stdout.write(f"\r  [{i+1}/{total_count}] {rec.filename[:55]:<55s}")
+            sys.stdout.flush()
+
+    results = process_records(
+        actionable, args.crf,
+        workers=workers, encoder=encoder,
+        progress_callback=on_progress,
+    )
 
     sys.stdout.write("\r" + " " * 80 + "\r")
     process_elapsed = time.perf_counter() - process_start
-
-    # Cleanup
-    shutil.rmtree(str(tmp_dir), ignore_errors=True)
 
     # Report
     report = generate_text_report(results)

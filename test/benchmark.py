@@ -15,8 +15,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from mediapress.__main__ import check_dependencies
 from mediapress.scanner import scan_folder
-from mediapress.processor import process_record
-import tempfile
+from mediapress.processor import process_records
+from mediapress.encoder import get_best_encoder, get_encoder_label, detect_available_encoders
 
 
 def main():
@@ -53,6 +53,11 @@ def main():
         with open(log_path, "w") as f:
             f.write("\n".join(lines) + "\n")
         return 1
+
+    encoder = get_best_encoder()
+    avail = detect_available_encoders()
+    log(f"  Encoder: {encoder} ({get_encoder_label(encoder)})")
+    log(f"  Available: {', '.join(f'{n} ({l})' for n, l in avail)}")
 
     # Clean output folder
     if output_folder.exists():
@@ -95,30 +100,25 @@ def main():
     log("  PHASE 2: PROCESS")
     log(f"{'─'*70}")
 
-    tmp_dir = Path(tempfile.mkdtemp(prefix="mediapress_bench_"))
+    actionable = [(i, r) for i, r in enumerate(records) if r.status != "Unsupported — skip"]
+    skipped = [r for r in records if r.status == "Unsupported — skip"]
+    for r in skipped:
+        log(f"    SKIP  {r.filename}")
+
     process_start = time.perf_counter()
-    results = []
 
-    for i, rec in enumerate(records):
-        if rec.status == "Unsupported — skip":
-            log(f"    [{i+1}/{len(records)}] SKIP  {rec.filename}")
-            results.append(rec)
-            continue
+    def on_progress(orig_idx, rec, i, total_count):
+        log(f"    [{i+1}/{total_count}] {rec.result:8s} {rec.filename:35s} "
+            f"{rec.original_size_mb:.1f}MB → {rec.output_size_mb:.1f}MB")
 
-        file_start = time.perf_counter()
-        process_record(rec, crf=23, tmp_dir=tmp_dir)
-        file_elapsed = time.perf_counter() - file_start
-
-        log(f"    [{i+1}/{len(records)}] {rec.result:8s} {rec.filename:35s} "
-            f"{rec.original_size_mb:.1f}MB → {rec.output_size_mb:.1f}MB  "
-            f"({file_elapsed:.2f}s)")
-        results.append(rec)
+    results = process_records(
+        actionable, crf=23,
+        encoder=encoder,
+        progress_callback=on_progress,
+    )
 
     process_elapsed = time.perf_counter() - process_start
     total_elapsed = scan_elapsed + process_elapsed
-
-    # Cleanup temp
-    shutil.rmtree(str(tmp_dir), ignore_errors=True)
 
     # Summary
     log()
